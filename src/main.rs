@@ -202,12 +202,15 @@ async fn kill_process(port: u16, process: ProcessInfo) -> Result<(), String> {
 
     println!("[{}] Found PID {} ({})", port, pid, name);
 
-    let signals = [Signal::SIGINT, Signal::SIGTERM, Signal::SIGKILL];
-    let signal_names = ["SIGINT", "SIGTERM", "SIGKILL"];
+    let signals = [
+        (Signal::SIGINT, "SIGINT"),
+        (Signal::SIGTERM, "SIGTERM"),
+        (Signal::SIGKILL, "SIGKILL"),
+    ];
 
     let start = std::time::Instant::now();
 
-    for (signal, signal_name) in signals.iter().zip(signal_names.iter()) {
+    for (signal, signal_name) in signals {
         if start.elapsed() >= TOTAL_TIMEOUT {
             return Err(format!("Total timeout exceeded for PID {}", pid));
         }
@@ -219,40 +222,34 @@ async fn kill_process(port: u16, process: ProcessInfo) -> Result<(), String> {
 
         println!("[{}] Sending {} to PID {}", port, signal_name, pid);
 
-        match send_signal(pid, *signal) {
-            Ok(()) => {}
-            Err(nix::errno::Errno::EPERM) => {
-                return Err(format!("EPERM: Permission denied for PID {}", pid));
-            }
-            Err(nix::errno::Errno::ESRCH) => {
-                println!("[{}] Process terminated", port);
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(format!("Failed to send signal to PID {}: {}", pid, e));
-            }
+        if let Err(e) = send_signal(pid, signal) {
+            return match e {
+                nix::errno::Errno::ESRCH => {
+                    println!("[{}] Process terminated", port);
+                    Ok(())
+                }
+                nix::errno::Errno::EPERM => {
+                    Err(format!("EPERM: Permission denied for PID {}", pid))
+                }
+                _ => Err(format!("Failed to send signal to PID {}: {}", pid, e)),
+            };
         }
 
-        let wait_result = timeout(MAX_WAIT_PER_SIGNAL, async {
+        let terminated = timeout(MAX_WAIT_PER_SIGNAL, async {
             loop {
                 sleep(POLL_INTERVAL).await;
                 if !process_exists(pid) {
-                    return true;
+                    return;
                 }
                 println!("[{}] Process still running, waiting...", port);
             }
         })
-        .await;
+        .await
+        .is_ok();
 
-        match wait_result {
-            Ok(true) => {
-                println!("[{}] Process terminated", port);
-                return Ok(());
-            }
-            Ok(false) => {}
-            Err(_) => {
-                // Timeout, escalate to next signal
-            }
+        if terminated {
+            println!("[{}] Process terminated", port);
+            return Ok(());
         }
     }
 
